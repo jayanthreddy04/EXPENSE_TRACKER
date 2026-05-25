@@ -1,7 +1,9 @@
+import '../config/env.js';
 import Tesseract from 'tesseract.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { traceable } from 'langsmith/traceable';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TESSDATA_DIR = path.join(__dirname, '..');
@@ -30,6 +32,29 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const GROQ_MODEL = process.env.GROQ_MODEL || 'meta-llama/llama-4-scout-17b-16e-instruct';
 const GEMINI_TIMEOUT_MS = 20_000;
 const GROQ_TIMEOUT_MS = 20_000;
+
+function traceImageInput(inputs) {
+  const imagePath = inputs.imagePath || inputs.input;
+  return {
+    imageName: imagePath ? path.basename(String(imagePath)) : null,
+  };
+}
+
+function traceAnalysisOutput(outputs) {
+  const analysis = outputs?.outputs ?? outputs;
+
+  if (!analysis) {
+    return { skipped: true };
+  }
+
+  return {
+    success: Boolean(analysis.success),
+    total: analysis.total ?? null,
+    amountCount: Array.isArray(analysis.amounts) ? analysis.amounts.length : 0,
+    matchedLine: analysis.matchedLine || null,
+    message: analysis.message || null,
+  };
+}
 
 function normalizeAmount(raw) {
   if (!raw) return null;
@@ -163,7 +188,7 @@ function normalizeCloudAnalysis(payload) {
   };
 }
 
-async function analyzeWithGroq(imagePath) {
+async function analyzeWithGroqImpl(imagePath) {
   if (!process.env.GROQ_API_KEY) {
     return null;
   }
@@ -229,7 +254,23 @@ async function analyzeWithGroq(imagePath) {
   }
 }
 
-async function analyzeWithGemini(imagePath) {
+const analyzeWithGroq = traceable(analyzeWithGroqImpl, {
+  name: 'receipt.analyze.groq',
+  run_type: 'llm',
+  metadata: {
+    provider: 'groq',
+    model: GROQ_MODEL,
+  },
+  getInvocationParams: () => ({
+    provider: 'groq',
+    model: GROQ_MODEL,
+    temperature: 0,
+  }),
+  processInputs: traceImageInput,
+  processOutputs: traceAnalysisOutput,
+});
+
+async function analyzeWithGeminiImpl(imagePath) {
   if (!process.env.GOOGLE_API_KEY) {
     return null;
   }
@@ -293,7 +334,23 @@ async function analyzeWithGemini(imagePath) {
   }
 }
 
-async function analyzeWithTesseract(imagePath) {
+const analyzeWithGemini = traceable(analyzeWithGeminiImpl, {
+  name: 'receipt.analyze.gemini',
+  run_type: 'llm',
+  metadata: {
+    provider: 'google',
+    model: GEMINI_MODEL,
+  },
+  getInvocationParams: () => ({
+    provider: 'google',
+    model: GEMINI_MODEL,
+    temperature: 0,
+  }),
+  processInputs: traceImageInput,
+  processOutputs: traceAnalysisOutput,
+});
+
+async function analyzeWithTesseractImpl(imagePath) {
   const { data } = await Tesseract.recognize(imagePath, 'eng', {
     langPath: TESSDATA_DIR,
     cachePath: TESSDATA_DIR,
@@ -329,7 +386,17 @@ async function analyzeWithTesseract(imagePath) {
   };
 }
 
-export async function analyzeReceiptImage(imagePath) {
+const analyzeWithTesseract = traceable(analyzeWithTesseractImpl, {
+  name: 'receipt.analyze.tesseract',
+  run_type: 'chain',
+  metadata: {
+    provider: 'tesseract',
+  },
+  processInputs: traceImageInput,
+  processOutputs: traceAnalysisOutput,
+});
+
+async function analyzeReceiptImageImpl(imagePath) {
   const groqAnalysis = await analyzeWithGroq(imagePath);
   if (groqAnalysis) {
     return groqAnalysis;
@@ -353,3 +420,13 @@ export async function analyzeReceiptImage(imagePath) {
 
   return analyzeWithTesseract(imagePath);
 }
+
+export const analyzeReceiptImage = traceable(analyzeReceiptImageImpl, {
+  name: 'receipt.analyze',
+  run_type: 'chain',
+  metadata: {
+    feature: 'receipt-ocr',
+  },
+  processInputs: traceImageInput,
+  processOutputs: traceAnalysisOutput,
+});

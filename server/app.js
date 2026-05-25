@@ -1,13 +1,11 @@
+import './config/env.js';
 import express from 'express';
 import cors from 'cors';
-import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import expenseRoutes from './routes/expenses.js';
 import authRoutes from './routes/auth.js';
 import { connectDB } from './db.js';
-
-dotenv.config();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -26,6 +24,13 @@ app.get('/api/health', (_req, res) => {
     ocr: {
       groqConfigured: Boolean(process.env.GROQ_API_KEY),
       googleConfigured: Boolean(process.env.GOOGLE_API_KEY),
+    },
+    tracing: {
+      langSmithConfigured: Boolean(process.env.LANGSMITH_API_KEY),
+      enabled:
+        process.env.LANGSMITH_TRACING === 'true' ||
+        process.env.LANGCHAIN_TRACING_V2 === 'true',
+      project: process.env.LANGSMITH_PROJECT || process.env.LANGCHAIN_PROJECT || null,
     },
   });
 });
