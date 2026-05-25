@@ -1,4 +1,5 @@
 import Tesseract from 'tesseract.js';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -24,6 +25,9 @@ const TOTAL_LABEL_PATTERNS = [
 
 const NON_TOTAL_LABEL_PATTERN =
   /\b(?:sub\s*total|subtotal|tax|gst|cgst|sgst|igst|vat|discount|change|balance|round\s*off|qty|quantity|mrp|rate|price)\b/i;
+
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GEMINI_TIMEOUT_MS = 20_000;
 
 function normalizeAmount(raw) {
   if (!raw) return null;
@@ -106,7 +110,122 @@ export function findTotalFromText(text) {
   return null;
 }
 
-export async function analyzeReceiptImage(imagePath) {
+function getMimeType(imagePath) {
+  const ext = path.extname(imagePath).toLowerCase();
+  if (ext === '.png') return 'image/png';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.gif') return 'image/gif';
+  if (ext === '.bmp') return 'image/bmp';
+  return 'image/jpeg';
+}
+
+function extractJson(text) {
+  const cleaned = String(text || '')
+    .replace(/```(?:json)?/gi, '')
+    .replace(/```/g, '')
+    .trim();
+  const start = cleaned.indexOf('{');
+  const end = cleaned.lastIndexOf('}');
+
+  if (start === -1 || end === -1 || end <= start) {
+    throw new Error('The receipt analyzer returned an unreadable response.');
+  }
+
+  return JSON.parse(cleaned.slice(start, end + 1));
+}
+
+function normalizeGeminiAnalysis(payload) {
+  const text = String(payload.rawText || payload.text || '');
+  const amounts = Array.isArray(payload.amounts)
+    ? payload.amounts.map(normalizeAmount).filter((amount) => amount != null)
+    : parseAmountsFromText(text);
+  const total = normalizeAmount(payload.total) ?? findTotalFromText(text)?.amount ?? amounts.at(-1);
+
+  if (total == null) {
+    return {
+      success: false,
+      message: payload.message || 'No bill total detected in the image. Try a clearer receipt photo.',
+      rawText: text.slice(0, 500),
+      amounts,
+      total: 0,
+    };
+  }
+
+  return {
+    success: true,
+    message: payload.message || 'Receipt total detected and saved',
+    rawText: text.slice(0, 500),
+    amounts: [...new Set([...amounts, total])].sort((a, b) => a - b),
+    total,
+    matchedLine: payload.matchedLine || null,
+  };
+}
+
+async function analyzeWithGemini(imagePath) {
+  if (!process.env.GOOGLE_API_KEY) {
+    return null;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+  const imageData = fs.readFileSync(imagePath).toString('base64');
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': process.env.GOOGLE_API_KEY,
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [
+              {
+                text:
+                  'Read this receipt image and return only JSON with keys: total number, amounts number array, matchedLine string, rawText string, message string. Use the final payable/grand total, not subtotal or tax.',
+              },
+              {
+                inlineData: {
+                  mimeType: getMimeType(imagePath),
+                  data: imageData,
+                },
+              },
+            ],
+          },
+        ],
+        generationConfig: {
+          temperature: 0,
+          responseMimeType: 'application/json',
+        },
+      }),
+    });
+
+    const body = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+      const message = body.error?.message || 'Receipt analyzer request failed.';
+      throw new Error(message);
+    }
+
+    const text = body.candidates?.[0]?.content?.parts
+      ?.map((part) => part.text || '')
+      .join('\n');
+
+    return normalizeGeminiAnalysis(extractJson(text));
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error('Receipt analysis timed out. Try a smaller or clearer image.');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function analyzeWithTesseract(imagePath) {
   const { data } = await Tesseract.recognize(imagePath, 'eng', {
     langPath: TESSDATA_DIR,
     cachePath: TESSDATA_DIR,
@@ -140,4 +259,23 @@ export async function analyzeReceiptImage(imagePath) {
     total,
     matchedLine: totalCandidate?.line || null,
   };
+}
+
+export async function analyzeReceiptImage(imagePath) {
+  const geminiAnalysis = await analyzeWithGemini(imagePath);
+  if (geminiAnalysis) {
+    return geminiAnalysis;
+  }
+
+  if (process.env.VERCEL) {
+    return {
+      success: false,
+      message: 'Receipt OCR is not configured. Add GOOGLE_API_KEY in Vercel environment variables.',
+      rawText: '',
+      amounts: [],
+      total: 0,
+    };
+  }
+
+  return analyzeWithTesseract(imagePath);
 }
