@@ -12,7 +12,15 @@ function base64UrlDecode(value) {
 }
 
 function getJwtSecret() {
-  return process.env.JWT_SECRET || 'expense-tracker-local-dev-secret';
+  if (process.env.JWT_SECRET) {
+    return process.env.JWT_SECRET;
+  }
+
+  if (process.env.VERCEL || process.env.NODE_ENV === 'production') {
+    throw new Error('JWT_SECRET is required in production.');
+  }
+
+  return 'expense-tracker-local-dev-secret';
 }
 
 function sign(input) {

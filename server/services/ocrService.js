@@ -27,7 +27,9 @@ const NON_TOTAL_LABEL_PATTERN =
   /\b(?:sub\s*total|subtotal|tax|gst|cgst|sgst|igst|vat|discount|change|balance|round\s*off|qty|quantity|mrp|rate|price)\b/i;
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GROQ_MODEL = process.env.GROQ_MODEL || 'meta-llama/llama-4-scout-17b-16e-instruct';
 const GEMINI_TIMEOUT_MS = 20_000;
+const GROQ_TIMEOUT_MS = 20_000;
 
 function normalizeAmount(raw) {
   if (!raw) return null;
@@ -134,7 +136,7 @@ function extractJson(text) {
   return JSON.parse(cleaned.slice(start, end + 1));
 }
 
-function normalizeGeminiAnalysis(payload) {
+function normalizeCloudAnalysis(payload) {
   const text = String(payload.rawText || payload.text || '');
   const amounts = Array.isArray(payload.amounts)
     ? payload.amounts.map(normalizeAmount).filter((amount) => amount != null)
@@ -159,6 +161,72 @@ function normalizeGeminiAnalysis(payload) {
     total,
     matchedLine: payload.matchedLine || null,
   };
+}
+
+async function analyzeWithGroq(imagePath) {
+  if (!process.env.GROQ_API_KEY) {
+    return null;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), GROQ_TIMEOUT_MS);
+  const mimeType = getMimeType(imagePath);
+  const imageData = fs.readFileSync(imagePath).toString('base64');
+
+  try {
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text:
+                  'Read this receipt image and return only JSON with keys: total number, amounts number array, matchedLine string, rawText string, message string. Use the final payable/grand total, not subtotal or tax.',
+              },
+              {
+                type: 'image_url',
+                image_url: {
+                  url: `data:${mimeType};base64,${imageData}`,
+                },
+              },
+            ],
+          },
+        ],
+        temperature: 0,
+        max_completion_tokens: 1024,
+        response_format: {
+          type: 'json_object',
+        },
+      }),
+    });
+
+    const body = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+      const message = body.error?.message || 'Receipt analyzer request failed.';
+      throw new Error(message);
+    }
+
+    const text = body.choices?.[0]?.message?.content;
+
+    return normalizeCloudAnalysis(extractJson(text));
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error('Receipt analysis timed out. Try a smaller or clearer image.');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function analyzeWithGemini(imagePath) {
@@ -214,7 +282,7 @@ async function analyzeWithGemini(imagePath) {
       ?.map((part) => part.text || '')
       .join('\n');
 
-    return normalizeGeminiAnalysis(extractJson(text));
+    return normalizeCloudAnalysis(extractJson(text));
   } catch (err) {
     if (err.name === 'AbortError') {
       throw new Error('Receipt analysis timed out. Try a smaller or clearer image.');
@@ -262,6 +330,11 @@ async function analyzeWithTesseract(imagePath) {
 }
 
 export async function analyzeReceiptImage(imagePath) {
+  const groqAnalysis = await analyzeWithGroq(imagePath);
+  if (groqAnalysis) {
+    return groqAnalysis;
+  }
+
   const geminiAnalysis = await analyzeWithGemini(imagePath);
   if (geminiAnalysis) {
     return geminiAnalysis;
@@ -270,7 +343,8 @@ export async function analyzeReceiptImage(imagePath) {
   if (process.env.VERCEL) {
     return {
       success: false,
-      message: 'Receipt OCR is not configured. Add GOOGLE_API_KEY in Vercel environment variables.',
+      message:
+        'Receipt OCR is not configured. Add GROQ_API_KEY or GOOGLE_API_KEY in Vercel environment variables.',
       rawText: '',
       amounts: [],
       total: 0,
