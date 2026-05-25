@@ -20,7 +20,14 @@ if (!process.env.VERCEL) {
 }
 
 app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok' });
+  res.json({
+    status: 'ok',
+    commit: process.env.VERCEL_GIT_COMMIT_SHA || 'local',
+    ocr: {
+      groqConfigured: Boolean(process.env.GROQ_API_KEY),
+      googleConfigured: Boolean(process.env.GOOGLE_API_KEY),
+    },
+  });
 });
 
 app.use('/api', async (_req, res, next) => {
